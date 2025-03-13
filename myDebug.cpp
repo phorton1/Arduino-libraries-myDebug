@@ -1,7 +1,9 @@
-//------------------------------------------
-// button and expression pedal routines
-//------------------------------------------
-// ESP32 and Teensy provide crude re-entrancy protection
+//-----------------------------------------
+// myDebug.cpp
+//-----------------------------------------
+// 2025-03-13 Modified teensy and ESP32 (untested) to
+// use a circular set of output buffers, as opposed to
+// semaphores, in attempt at making this code re-entrant.
 
 #include "myDebug.h"
 
@@ -12,29 +14,56 @@ Stream *dbgSerial = &Serial;
 Stream *extraSerial = 0;
 
 
+#if defined(CORE_TEENSY) || defined(ESP32)
+    #define DISPLAY_BUFFER_SIZE     255
+	#define NUM_DISPLAY_BUFFERS		5
+#else
+    #define DISPLAY_BUFFER_SIZE     80
+#endif
+
+
 #if WITH_DISPLAY || WITH_WARNINGS || WITH_ERRORS
-    char display_buffer1[DISPLAY_BUFFER_SIZE];
-    #if USE_PROGMEM
-        char display_buffer2[DISPLAY_BUFFER_SIZE];
+	#if defined(CORE_TEENSY) || defined(ESP32)
+		volatile static int buf_head = 0;
+		volatile static int buf_tail = 0;
+		static char display_buffer[NUM_DISPLAY_BUFFERS][DISPLAY_BUFFER_SIZE];
+
+		// if there is a buffer overflow, there's no good way to display it
+		// so, for now, I am not going to check buf_tail, although I will try
+		// to update it when the buffer is finished being used.
+
+		static char *get_next_display_buffer()
+		{
+			char *retval = display_buffer[buf_head++];
+			if (buf_head == NUM_DISPLAY_BUFFERS)
+				buf_head = 0;
+			return retval;
+		}
+
+
+    #else	// arduino uses two buffers
+		static char display_buffer1[DISPLAY_BUFFER_SIZE];
+        static char display_buffer2[DISPLAY_BUFFER_SIZE];
+			// one for unpacking PROGMEM, and the other for the sprintf
     #endif
 #endif
 
 
-#if defined(CORE_TEENSY) || defined(ESP32)
-    volatile bool in_display = 0;
-    static void waitSem()
-    {
-        while (in_display) {delay(1);}
-        in_display = 1;
-    }
-    static void releaseSem()
-    {
-        in_display = 0;
-    }
-#else
+//	#if defined(CORE_TEENSY) || defined(ESP32)
+//	    volatile bool in_display = 0;
+//	    static void waitSem()
+//	    {
+//	        while (in_display) {delay(1);}
+//	        in_display = 1;
+//	    }
+//	    static void releaseSem()
+//	    {
+//	        in_display = 0;
+//	    }
+//	#else
     #define waitSem()
     #define releaseSem()
-#endif
+//  #endif
 
 
 // string is "\033[%d;" with following
@@ -111,7 +140,6 @@ Stream *extraSerial = 0;
 		{
 			if (!dbgSerial && !extraSerial)
 				return;
-			checkMem();
 			if (level > debug_level)
 				return;
 			waitSem();
@@ -146,7 +174,6 @@ Stream *extraSerial = 0;
     {
         if (!dbgSerial && !extraSerial)
             return;
-        checkMem();
         if (level > debug_level)
             return;
         waitSem();
@@ -155,21 +182,27 @@ Stream *extraSerial = 0;
             delay(2);
         #endif
 
+		#if defined(CORE_TEENSY) || defined(ESP32)
+			char *out_buffer = get_next_display_buffer();
+		#else
+			char *out_buffer = display_buffer2;
+		#endif
+
         va_list var;
         va_start(var, format);
 
-        #if USE_PROGMEM
+		#if defined(CORE_TEENSY) || defined(ESP32)
+			vsnprintf(out_buffer,DISPLAY_BUFFER_SIZE,format,var);
+
+        #else
             if (strlen_P(format) >= DISPLAY_BUFFER_SIZE)
             {
                 dbgSerial->println(F("error - display progmem buffer overflow"));
                 releaseSem();
                 return;
             }
-            strcpy_P(display_buffer2,format);
-            vsprintf(display_buffer1,display_buffer2,var);
-			vsnprintf(display_buffer1,DISPLAY_BUFFER_SIZE,display_buffer2,var);
-        #else
-			vsnprintf(display_buffer1,DISPLAY_BUFFER_SIZE,format,var);
+            strcpy_P(display_buffer1,format);
+			vsnprintf(display_buffer2,DISPLAY_BUFFER_SIZE,display_buffer1,var);
         #endif
 
 		if (dbgSerial)
@@ -178,7 +211,7 @@ Stream *extraSerial = 0;
 			#if WITH_INDENTS
 				indent();
 			#endif
-			dbgSerial->println(display_buffer1);
+			dbgSerial->println(out_buffer);
 		}
         if (extraSerial)
 		{
@@ -186,8 +219,15 @@ Stream *extraSerial = 0;
 			#if WITH_INDENTS
 				indent(extraSerial);
 			#endif
-            extraSerial->println(display_buffer1);
+            extraSerial->println(out_buffer);
 		}
+
+		#if defined(CORE_TEENSY) || defined(ESP32)
+			// buf_tail *would* be used for circular buffer overflow check
+			buf_tail++;
+			if (buf_tail == NUM_DISPLAY_BUFFERS)
+				buf_tail = 0;
+		#endif
 
         releaseSem();
     }
@@ -200,26 +240,30 @@ Stream *extraSerial = 0;
     {
         if (!dbgSerial && !extraSerial)
             return;
-        checkMem();
         if (level > warning_level)
             return;
         waitSem();
 
+		#if defined(CORE_TEENSY) || defined(ESP32)
+			char *out_buffer = get_next_display_buffer();
+		#else
+			char *out_buffer = display_buffer2;
+		#endif
+
         va_list var;
         va_start(var, format);
 
-        #if USE_PROGMEM
+		#if defined(CORE_TEENSY) || defined(ESP32)
+			vsnprintf(out_buffer,DISPLAY_BUFFER_SIZE,format,var);
+        #else
             if (strlen_P(format) >= DISPLAY_BUFFER_SIZE)
             {
                 dbgSerial->println(F("error - warning progmem buffer overflow"));
                 releaseSem();
                 return;
             }
-            strcpy_P(display_buffer2,format);
-            vsprintf(display_buffer1,display_buffer2,var);
-			vsnprintf(display_buffer1,DISPLAY_BUFFER_SIZE,display_buffer2,var);
-        #else
-			vsnprintf(display_buffer1,DISPLAY_BUFFER_SIZE,format,var);
+            strcpy_P(display_buffer1,format);
+			vsnprintf(display_buffer2,DISPLAY_BUFFER_SIZE,display_buffer1,var);
         #endif
 
 		if (dbgSerial)
@@ -229,7 +273,7 @@ Stream *extraSerial = 0;
 				indent();
 			#endif
 			dbgSerial->print("WARNING - ");
-			dbgSerial->println(display_buffer1);
+			dbgSerial->println(out_buffer);
 		}
         if (extraSerial)
         {
@@ -238,7 +282,7 @@ Stream *extraSerial = 0;
 				indent(extraSerial);
 			#endif
             extraSerial->print("WARNING - ");
-            extraSerial->println(display_buffer1);
+            extraSerial->println(out_buffer);
         }
         releaseSem();
     }
@@ -250,37 +294,41 @@ Stream *extraSerial = 0;
     {
         if (!dbgSerial && !extraSerial)
             return;
-        checkMem();
         waitSem();
+
+		#if defined(CORE_TEENSY) || defined(ESP32)
+			char *out_buffer = get_next_display_buffer();
+		#else
+			char *out_buffer = display_buffer2;
+		#endif
 
         va_list var;
         va_start(var, format);
 
-        #if USE_PROGMEM
-            if (strlen_P(format) >= DISPLAY_BUFFER_SIZE)
+        #if defined(CORE_TEENSY) || defined(ESP32)
+        	vsnprintf(out_buffer,DISPLAY_BUFFER_SIZE,format,var);
+		#else
+			if (strlen_P(format) >= DISPLAY_BUFFER_SIZE)
             {
                 dbgSerial->println(F("error - error progmem buffer overflow"));
                 releaseSem();
                 return;
             }
-            strcpy_P(display_buffer2,format);
-            vsprintf(display_buffer1,display_buffer2,var);
-			vsnprintf(display_buffer1,DISPLAY_BUFFER_SIZE,display_buffer2,var);
-        #else
-			vsnprintf(display_buffer1,DISPLAY_BUFFER_SIZE,format,var);
+            strcpy_P(display_buffer1,format);
+			vsnprintf(display_buffer2,DISPLAY_BUFFER_SIZE,display_buffer1,var);
         #endif
 
         if (dbgSerial)
 		{
 			dbgSerial->print(ERROR_COLOR_STRING);
 			dbgSerial->print("ERROR - ");
-			dbgSerial->println(display_buffer1);
+			dbgSerial->println(out_buffer);
 		}
         if (extraSerial)
         {
 			extraSerial->print(ERROR_COLOR_STRING);
             extraSerial->print("ERROR - ");
-            extraSerial->println(display_buffer1);
+            extraSerial->println(out_buffer);
         }
         releaseSem();
     }
@@ -375,7 +423,6 @@ Stream *extraSerial = 0;
         void display_bytes(int level, const char *label, const uint8_t *buf, int len)
         {
             if (!dbgSerial) return;
-            checkMem();
             if (level > debug_level) return;
             if (!len)
             {
@@ -422,8 +469,6 @@ Stream *extraSerial = 0;
             use_stream = dbgSerial;
         if (!use_stream) return;
         waitSem();
-
-        // checkMem();
 
         if (level > debug_level) return;
         if (!len)
@@ -472,85 +517,6 @@ Stream *extraSerial = 0;
 #endif  // WITH_DISPLAY_BYTES_LONG
 
 
-
-//------------------------------------------------------
-// memory debugging
-//------------------------------------------------------
-
-#if USE_MEMORY_CHECK
-    extern "C" {
-
-        // code copied from Arduino Playground
-
-        extern unsigned int __heap_start;
-        extern void *__brkval;
-
-
-        // The free list structure as maintained by the
-        // avr-libc memory allocation routines.
-
-        struct __freelist {
-            size_t sz;
-            struct __freelist *nx;
-        };
-
-        // The head of the free list structure
-
-        extern struct __freelist *__flp;
-
-
-        // Calculates the size of the free list
-        int freeListSize()
-        {
-            struct __freelist* current;
-            int total = 0;
-            for (current = __flp; current; current = current->nx)
-            {
-                total += 2;
-                    // Add two bytes for the memory block's header
-                total += (int) current->sz;
-            }
-            return total;
-        }
-
-        int freeMemory()
-        {
-            int free_memory;
-            if ((int)__brkval == 0)
-            {
-                free_memory = ((int)&free_memory) - ((int)&__heap_start);
-            }
-            else
-            {
-                free_memory = ((int)&free_memory) - ((int)__brkval);
-                free_memory += freeListSize();
-            }
-            return free_memory;
-        }
-
-        // my code
-
-        void checkMem()
-        {
-            if (!dbgSerial) return;
-            int free_mem = freeMemory();
-            if (free_mem < MEMORY_LIMIT_WARNING)
-            {
-                dbgSerial->print("MEMORY WARNING!! free=");
-                dbgSerial->println(free_mem);
-            }
-        }
-
-        void dbgMem()
-        {
-            if (!dbgSerial) return;
-            dbgSerial->print("DEBUG MEMORY = ");
-            dbgSerial->println(freeMemory());
-        }
-
-    }   // extern "C"
-
-#endif // USE_MEMORY_CHECK
 
 
 #if !defined(CORE_TEENSY) && !defined(ESP32)
